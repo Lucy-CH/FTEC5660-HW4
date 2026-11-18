@@ -19,30 +19,35 @@ import hw4
 FINAL = dict(hw4.CONFIG)
 
 # Each row: label, the settings that differ from the row above, and why the change was tried.
+OFF = dict(table_to_text=False, structured_chunking=False, metadata_filter=False, hybrid_scoring=False,
+           context_header=False, better_tokenizer=False, per_company_retrieval=False, abstention=False,
+           compact_context=False)
+
 STEPS = [
-    ("B0 naive RAG", dict(
-        table_to_text=False, metadata_filter=False, better_tokenizer=False,
-        per_company_retrieval=False, context_header=False, abstention=False, max_return=5),
-     "Baseline of the handout: get_text() and RecursiveCharacterTextSplitter(), BM25 over the whole "
-     "corpus, no query parsing, never abstain."),
-    ("V1 structured tables", dict(table_to_text=True),
-     "Tables become one line per row with its label and column headers."),
-    ("V2 metadata filtering", dict(metadata_filter=True),
-     "parse_query() narrows the candidate pool to the question's company, year and document type."),
-    ("V3 context header", dict(context_header=True),
-     "Every chunk starts with its company, year, document type, section and table caption, which gives "
-     "the index the words a question uses for a section ('balance sheet', 'borrowings')."),
-    ("V4 better tokenizer", dict(better_tokenizer=True),
-     "Numbers, years and entities are tokenised properly, plurals folded, synonyms expanded. Tried "
-     "before the header this made retrieval worse, so it comes after it."),
-    ("V5 per-company retrieval", dict(per_company_retrieval=True),
-     "A comparison question runs one retrieval per company, so each company has a chunk."),
-    ("V6 abstention", dict(abstention=True),
-     "Return [] for a company that is not in the corpus, a year it does not state, or a fact the "
-     "retrieved chunks do not state (coverage threshold + a model yes/no check)."),
-    ("V7 fewer chunks", dict(max_return=4),
-     "Hand the generator at most four chunks instead of five and drop the tail below 35% of the best "
-     "BM25 score, so fewer look-alike passages compete for attention."),
+    ("B0 naive RAG", OFF,
+     "get_text() + RecursiveCharacterTextSplitter(1000, 150), required metadata, rank_bm25 top-5 over "
+     "the whole corpus with lower-cased whitespace tokens, no query parsing, never []."),
+    ("V1 table_to_text", dict(table_to_text=True),
+     "Each table becomes one line per row with its label and column headers; still flat-split."),
+    ("V2 structured chunking", dict(structured_chunking=True),
+     "One chunk per table (split on row boundaries), narrative grouped by section instead of a "
+     "fixed-size character splitter."),
+    ("V3 metadata filtering", dict(metadata_filter=True),
+     "parse_query(); the BM25 pool is restricted to the question's company and document type."),
+    ("V4 hybrid scoring", dict(hybrid_scoring=True),
+     "BM25 + a year bonus + IDF-weighted share of question terms in the chunk + a table-row bonus."),
+    ("V5 context header", dict(context_header=True),
+     "Every chunk starts with company | FY | doc type | caption | section."),
+    ("V6 better tokenizer", dict(better_tokenizer=True),
+     "Stop words, possessives, numbers without commas, plural folding, synonym expansion."),
+    ("V7 per-company retrieval", dict(per_company_retrieval=True),
+     "A comparison runs one ranking per company and takes the top chunks of each."),
+    ("V8 abstention", dict(abstention=True),
+     "[] for a company not in the corpus, a year its documents do not state, an undisclosed-fact "
+     "phrase, or a failed model YES/NO check when lexical coverage is low."),
+    ("V9 compact context", dict(compact_context=True),
+     "Dedupe by table/section, 3 chunks (2 per company for a comparison), drop the tail below 35% "
+     "of the best score."),
 ]
 
 
@@ -86,8 +91,11 @@ def run_config(corpus: dict[str, str], questions: dict[str, str], ground_truth: 
     if not hw4.CONFIG["table_to_text"]:
         table_note = "n/a (naive get_text)"
 
+    avg_chunks = sum(len(retrieved[q]) for q in questions) / max(len(questions), 1)
+
     return {
         "parse": parse, "recall": hits, "kept": kept, "rejected": rejected, "accuracy": accuracy,
+        "avg_chunks": avg_chunks,
         "points_2_2": hw4.POINTS["2.2"] * parse,
         "points_2_3": hw4.POINTS["2.3"] * hw4.clip((hits - hw4.RECALL_ZERO) / (hw4.RECALL_FULL - hw4.RECALL_ZERO)),
         "points_3": hw4.POINTS["3"] * hw4.clip(kept + rejected - 1),
@@ -126,7 +134,7 @@ def main() -> None:
               f"({elapsed:.0f}s)", flush=True)
 
     fields = ["configuration", "change", "reason", "parse", "recall", "kept", "rejected", "accuracy",
-              "points_2_2", "points_2_3", "points_3", "points_4", "table_note", "seconds"]
+              "avg_chunks", "points_2_2", "points_2_3", "points_3", "points_4", "table_note", "seconds"]
     with open(args.output, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()

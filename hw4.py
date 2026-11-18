@@ -25,6 +25,7 @@ from dotenv import load_dotenv
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.documents import Document
 from langchain_deepseek import ChatDeepSeek
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 load_dotenv()
 
@@ -37,24 +38,31 @@ import math
 from collections import defaultdict
 
 from bs4 import BeautifulSoup
+from bs4.element import NavigableString
 
 # System switches. The defaults are the final system described in README.md; ablation.py flips them
 # one at a time to produce the Task 5 table.
 CONFIG = {
-    "table_to_text": True,        # V1: structured table text instead of get_text()
-    "metadata_filter": True,      # V2: filter candidates by company / year / doc type
-    "better_tokenizer": True,     # V3: keep numbers and years, light plural folding
-    "per_company_retrieval": True,  # V4: one query per company for comparisons
-    "context_header": True,       # V5: a metadata + section header line on every chunk
-    "abstention": True,           # V6: return [] when the corpus cannot answer
-    "max_return": 4,              # chunks handed to the generator
+    "table_to_text": True,        # V1: structured table text instead of a cell stream
+    "structured_chunking": True,  # V2: one chunk per table, narrative grouped by section
+    "metadata_filter": True,      # V3: candidate pool = the question's company and document type
+    "hybrid_scoring": True,       # V4: year bonus + IDF coverage + table-row bonus on top of BM25
+    "context_header": True,       # V5: a metadata + section + caption header line on every chunk
+    "better_tokenizer": True,     # V6: keep numbers and years, fold plurals, expand synonyms
+    "per_company_retrieval": True,  # V7: one ranking per company for comparisons
+    "abstention": True,           # V8: return [] when the corpus cannot answer
+    "compact_context": True,      # V9: dedupe, cap at 3-4 chunks, drop the tail below 35%
 }
+
+_MAX_FINAL = 4                # chunks handed to the generator when compact_context is on
+_NAIVE_CHUNK_CHARS = 1000     # B0/V1: RecursiveCharacterTextSplitter chunk size
+_NAIVE_CHUNK_OVERLAP = 150    # B0/V1: its overlap
 
 _MAX_BLOCK_CHARS = 1200       # narrative blocks are grouped up to this size
 _TABLE_CHUNK_CHARS = 1300     # one table is split on row boundaries beyond this
 _PREFERRED_ROWS = 3           # chunks per company for a single-company question
 _PREFERRED_ROWS_CMP = 2       # chunks per company for a comparison
-_SCORE_KEEP = 0.35            # drop candidates far below the best one
+_SCORE_KEEP = 0.35            # drop candidates far below the best one (compact_context only)
 _COVERAGE_MIN = 0.45          # below this, the model is asked whether the passages answer it
 _COVERAGE_WEIGHT = 6.0        # ranking: bonus for a chunk that contains every question term
 _ROWHIT_WEIGHT = 1.5          # ranking: bonus for question terms landing on a table row
@@ -422,6 +430,22 @@ def chunk_document(file_name: str, html: str) -> list[Document]:
     _ENTITIES["docs"].append({"file": file_name, "company_key": _company_key(company),
                               "fiscal_year": int(fiscal_year), "doc_type": doc_type})
 
+    # ---- B0/V1: flat chunking, get_text() + RecursiveCharacterTextSplitter, as in Tutorial 7
+    if not CONFIG["structured_chunking"]:
+        flat = BeautifulSoup(html, "lxml")
+        for tag in flat(["script", "style", "noscript"]):
+            tag.decompose()
+        for table in flat.find_all("table"):
+            if table.find_parent("table") is None:
+                body = (_one_table_to_text(table) if CONFIG["table_to_text"]
+                        else "\n".join(_cell_text(cell) for cell in table.find_all(["th", "td"])))
+                table.replace_with(NavigableString(f"\n{body}\n"))
+        text = flat.get_text("\n", strip=True)
+        splitter = RecursiveCharacterTextSplitter(chunk_size=_NAIVE_CHUNK_CHARS,
+                                                  chunk_overlap=_NAIVE_CHUNK_OVERLAP)
+        return [Document(page_content=piece, metadata=dict(meta))
+                for piece in splitter.split_text(text) if piece.strip()]
+
     # ---- walk the document in order, keeping tables apart from the narrative
     chunks: list[Document] = []
     section = ""
@@ -777,6 +801,8 @@ def _score(index: dict, chunk_idx: int, question_tokens: list[str], year: int | 
            bm25_scores, content: list[str] | None = None) -> float:
     chunk = index["chunks"][chunk_idx]
     score = float(bm25_scores[chunk_idx])
+    if not CONFIG["hybrid_scoring"]:
+        return score  # B0/V1/V2/V3: plain BM25
     if year is not None:
         if f"fy{year}" in chunk.page_content.lower() or re.search(rf"\b{year}\b", chunk.page_content):
             score += 1.0
@@ -800,12 +826,16 @@ def _rank_pool(index: dict, pool: list[int], question_tokens: list[str], year: i
     ranked = sorted(pool, key=score_of, reverse=True)
     if not ranked:
         return []
+    if not CONFIG["compact_context"]:
+        return ranked
     best = score_of(ranked[0])
     return [i for i in ranked if score_of(i) >= best * _SCORE_KEEP]
 
 
 def _dedupe(ranked: list[int], index: dict) -> list[int]:
     """Keep one chunk per (company, table caption / section) so a table is not handed over twice."""
+    if not CONFIG["compact_context"]:
+        return list(ranked)
     seen: set[tuple] = set()
     out: list[int] = []
     for i in ranked:
@@ -829,7 +859,13 @@ def retrieve(index: Any, question: str) -> list[Document]:
     """
     if not index or not index.get("chunks"):
         return []
+    if not any(CONFIG.get(k, True) for k in ("metadata_filter", "hybrid_scoring", "context_header",
+                                             "better_tokenizer", "per_company_retrieval",
+                                             "abstention", "compact_context")):
+        return _naive_retrieve(index, question)  # B0: plain BM25 over the whole corpus, never []
     parsed = parse_query(question)
+    if not CONFIG["metadata_filter"]:  # B0/V1/V2 do not parse the question at all
+        parsed = {"companies": [], "fiscal_year": None, "doc_type": "annual_report"}
     year = parsed.get("fiscal_year")
     doc_type = parsed.get("doc_type", "annual_report")
     named = parsed.get("companies", [])
@@ -842,11 +878,14 @@ def retrieve(index: Any, question: str) -> list[Document]:
             known.append(key)
         elif _first_word(key) in {_first_word(k) for k in known_companies}:
             # looks like a corpus company but is not in the corpus: abstain
-            return []
+            if CONFIG["abstention"]:
+                return []
         elif named == [name]:
-            return []
+            if CONFIG["abstention"]:
+                return []
         else:
-            return []
+            if CONFIG["abstention"]:
+                return []
 
     if CONFIG["abstention"] and known and year is not None:
         covered: set[int] = set()
@@ -859,7 +898,8 @@ def retrieve(index: Any, question: str) -> list[Document]:
     question_tokens = _expand(_tok(question)) if CONFIG["better_tokenizer"] else _tok(question)
     bm25_scores = index["bm25"].get_scores(question_tokens) if index["bm25"] is not None else None
     content = _content_words(question, parsed)
-    max_return = int(CONFIG["max_return"])
+    compact = CONFIG["compact_context"]
+    max_return = _MAX_FINAL if compact else MAX_RETRIEVED
 
     def pool_for(key: str) -> list[int]:
         if not CONFIG["metadata_filter"]:
@@ -881,13 +921,14 @@ def retrieve(index: Any, question: str) -> list[Document]:
             ranked = _dedupe(_rank_pool(index, pool_for(key), question_tokens, year, bm25_scores, content),
                              index)
             picked.extend(ranked[:min(per_company, _PREFERRED_ROWS_CMP)])
-        picked = picked[:MAX_RETRIEVED]
+        picked = picked[:max_return]
     else:
         ranked = []
         for key in known:
             ranked.extend(_rank_pool(index, pool_for(key), question_tokens, year, bm25_scores, content))
         ranked.sort(key=lambda i: _score(index, i, question_tokens, year, bm25_scores, content), reverse=True)
-        picked = _dedupe(ranked, index)[:min(_PREFERRED_ROWS, max_return)]
+        cap = min(_PREFERRED_ROWS, max_return) if compact else max_return
+        picked = _dedupe(ranked, index)[:cap]
 
     if not picked:
         return []
@@ -900,7 +941,16 @@ def retrieve(index: Any, question: str) -> list[Document]:
         if best < _COVERAGE_CERTAIN and not _answerable(question, [index["chunks"][i] for i in picked[:3]]):
             return []
 
-    return [index["chunks"][i] for i in picked[:MAX_RETRIEVED]]
+    return [index["chunks"][i] for i in picked[:max_return]]
+
+
+def _naive_retrieve(index: dict, question: str) -> list[Document]:
+    """B0 baseline only: BM25 top-5 over the whole corpus, no parsing, no filter, never []."""
+    if index["bm25"] is None:
+        return []
+    scores = index["bm25"].get_scores(_tok(question))
+    order = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:MAX_RETRIEVED]
+    return [index["chunks"][i] for i in order]
 
 
 # =============================================================================

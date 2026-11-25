@@ -43,8 +43,8 @@ STEPS = [
     ("V7 per-company retrieval", dict(per_company_retrieval=True),
      "A comparison runs one ranking per company and takes the top chunks of each."),
     ("V8 abstention", dict(abstention=True),
-     "[] for a company not in the corpus, a year its documents do not state, an undisclosed-fact "
-     "phrase, or a failed model YES/NO check when lexical coverage is low."),
+     "[] for a company not in the corpus, a year its documents do not state, a question whose content "
+     "words cover less than 30% of the best passages, or a failed model YES/NO check."),
     ("V9 compact context", dict(compact_context=True),
      "Dedupe by table/section, 3 chunks (2 per company for a comparison), drop the tail below 35% "
      "of the best score."),

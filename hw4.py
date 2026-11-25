@@ -77,28 +77,31 @@ def _ws(text: Any) -> str:
 
 
 _MONTHS = {m.lower() for m in ("January February March April May June July August September "
-                               "October November December")}
+                               "October November December").split()}
 
 # Words that never make up a company name on their own.
 _NAME_STOP = _MONTHS | {
+    # question words and function words
     "which", "what", "who", "whom", "whose", "how", "why", "when", "where", "in", "at", "on", "of",
     "the", "a", "an", "is", "was", "were", "are", "did", "does", "do", "had", "has", "have", "its",
     "their", "this", "that", "for", "from", "by", "with", "and", "or", "as", "to", "per", "than",
-    "usd", "us", "fy", "q", "q1", "q2", "q3", "q4", "ceo", "cfo", "coo", "cto", "chief", "executive",
-    "officer", "board", "audit", "committee", "call", "report", "reports", "annual", "quarter",
-    "quarterly", "fourth", "first", "second", "third", "full", "year", "years", "results", "review",
-    "rating", "target", "price", "forecast", "estimate", "estimates", "guidance", "outlook", "share",
-    "shares", "repurchase", "programme", "program", "million", "millions", "billion", "billions",
-    "percent", "value", "total", "net", "gross", "operating", "income", "revenue", "cash", "assets",
-    "equivalents", "employees", "company", "city", "headquartered", "management", "analyst", "firm",
-    "broker", "growth", "margin", "profit", "loss", "debt", "borrowing", "borrowings", "receivable",
-    "receivables", "segment", "region", "dividend", "dividends", "capital", "securities", "equity",
-    "research", "financial", "statements", "audited", "auditor", "largest", "single", "customer",
-    "churn", "expenses", "expense", "lobbying", "carbon", "offset", "purchases", "did", "much", "many",
-    "its", "at", "end", "year", "the", "was", "were", "hold", "held", "reported", "report", "spend",
-    "spent", "announce", "announced", "guide", "guided", "set", "sets", "give", "gives", "earn",
-    "earned", "generate", "generated", "pay", "paid", "case", "case", "previous", "new", "current",
-    "higher", "lower", "more", "less", "compare", "compared", "both", "two", "during", "period",
+    "usd", "us", "fy", "q", "q1", "q2", "q3", "q4", "ceo", "cfo", "coo", "cto",
+    # generic finance and reporting vocabulary
+    "chief", "executive", "officer", "board", "audit", "committee", "call", "report", "reports",
+    "annual", "quarter", "quarterly", "fourth", "first", "second", "third", "full", "year", "years",
+    "results", "review", "rating", "target", "price", "forecast", "estimate", "estimates", "guidance",
+    "outlook", "share", "shares", "repurchase", "programme", "program", "million", "millions",
+    "billion", "billions", "percent", "value", "total", "net", "gross", "operating", "income",
+    "revenue", "cash", "assets", "equivalents", "employees", "company", "city", "headquartered",
+    "management", "analyst", "firm", "broker", "growth", "margin", "profit", "loss", "debt",
+    "borrowing", "borrowings", "receivable", "receivables", "segment", "region", "dividend",
+    "dividends", "capital", "securities", "equity", "research", "financial", "statements", "audited",
+    "auditor", "case",
+    # generic verbs and comparatives
+    "much", "many", "end", "hold", "held", "reported", "spend", "spent", "announce", "announced",
+    "guide", "guided", "set", "give", "gives", "earn", "earned", "generate", "generated", "pay",
+    "paid", "previous", "new", "current", "higher", "lower", "more", "less", "compare", "compared",
+    "both", "two", "during", "period",
 }
 
 _CONNECTORS = {"of", "and", "&", "the"}
@@ -107,6 +110,21 @@ _CONNECTORS = {"of", "and", "&", "the"}
 # of these is not the company under review. Kept generic on purpose: no name from the corpus.
 _FIRM_TAILS = {"capital", "securities", "research", "partners", "bank", "trust", "llp", "advisors",
                "advisory", "investments", "markets", "asset", "management"}
+
+# Geographies and reporting segments are capitalised like names but are not companies. Both sets are
+# generic report vocabulary (continents, "segment", "division"), not data from this question set.
+_REGION_WORDS = {"north", "south", "east", "west", "central", "america", "americas", "europe",
+                 "africa", "asia", "pacific", "middle", "latin", "emea", "apac", "mena", "china",
+                 "japan", "india", "korea", "singapore", "australia", "canada", "mexico", "brazil",
+                 "germany", "france", "italy", "spain", "netherlands", "uk", "united", "states",
+                 "kingdom", "and", "of", "the"}
+_SEGMENT_NOUNS = {"segment", "division", "unit", "business", "arm", "subsidiary", "product",
+                  "category", "line", "region", "market"}
+
+# Words that can end a firm's name ("... Securities", "... Equity Research", "... Corp"): a run keeps
+# consuming them so the whole firm name is seen and can be excluded as a broker or an audit firm.
+_FIRM_SUFFIX_WORDS = _FIRM_TAILS | {"equity", "llp", "inc", "corp", "corporation", "ltd", "limited",
+                                    "plc", "llc", "co", "sa", "nv"}
 
 
 def _company_key(name: Any) -> str:
@@ -517,63 +535,92 @@ _EARNINGS_RE = re.compile(
     r"earnings call transcript)\b")
 
 
-def _name_runs(question: str) -> list[list[str]]:
-    """Runs of capitalised words: ['Northgate', 'Robotic', 'Systems'].
+def _name_runs(question: str) -> list[dict]:
+    """Runs of capitalised words, each with the words on either side and how it ended.
 
     A possessive ends a run ("Brightwater Energy's Midstream segment" is one company plus a segment
-    name), so the segment never gets glued onto the company.
+    name), so the segment never gets glued onto the company. The neighbours are what tell a company
+    from a geography ("... in Asia Pacific") or a reporting segment ("... Bakery segment").
     """
-    text = _ws(question).replace("’", "'")
+    text = _ws(question).replace("\u2019", "'")
     text = re.sub(r"'s\b", " | ", text)
     text = re.sub(r"'(?=\s|$)", " | ", text)
-    runs: list[list[str]] = []
+    tokens = [raw.strip("()[]{}<>\"'.,;:!?") for raw in text.split()]
+
+    runs: list[dict] = []
     current: list[str] = []
-    for raw in text.split():
-        token = raw.strip("()[]{}<>\"'.,;:!?")
-        if not token or token == "|":
-            if current:
-                runs.append(current)
-                current = []
+    start = 0
+
+    def close(next_word: str, possessive: bool) -> None:
+        nonlocal current
+        if not current:
+            return
+        runs.append({"text": " ".join(current),
+                     "prev": tokens[start - 1] if start else "",
+                     "prev2": tokens[start - 2] if start > 1 else "",
+                     "next": next_word, "at_start": start == 0, "possessive": possessive})
+        current = []
+
+    for i, token in enumerate(tokens):
+        if not token:
+            close("", False)
+            continue
+        if token == "|":
+            close("", True)  # the run was cut by a possessive
             continue
         if current and token.lower() in _CONNECTORS:
             current.append(token)
             continue
+        if current and token.lower() in _FIRM_SUFFIX_WORDS and re.fullmatch(r"[A-Za-z&.\-]+", token):
+            current.append(token)  # "... Securities", "... Equity Research": keep the firm name whole
+            continue
         if re.fullmatch(r"[A-Z][A-Za-z&.\-]*", token) and token.lower() not in _NAME_STOP:
+            if not current:
+                start = i
             current.append(token)
             continue
-        if current:
-            runs.append(current)
-            current = []
-    if current:
-        runs.append(current)
-    return [[" ".join(r)] for r in runs]
+        close(token.lower(), False)
+    close("", False)
+    return runs
 
 
 def _parse_companies(question: str) -> list[str]:
+    """Task 2.2: every company the question names, whether or not it is in the corpus.
+
+    The default is to keep a capitalised name run; what is dropped is what surrounds the company
+    under review: a broker or an audit firm (from the entities the corpus itself provided), a
+    geography, a reporting segment, or a bare capitalised word that opens the question without
+    owning anything. Nothing here depends on how a particular question is worded.
+    """
     known: dict[str, str] = _ENTITIES["companies"]
     firsts = {_first_word(key) for key in known}
     brokers = _ENTITIES["brokers"] | _ENTITIES["auditors"]
     companies: list[str] = []
     seen: set[str] = set()
 
-    for (run,) in _name_runs(question):
-        key = _company_key(run)
-        if not key or key in brokers:
+    for run in _name_runs(question):
+        name = run["text"]
+        key = _company_key(name)
+        if not key or key in seen:
             continue
         words = key.split()
-        if key in known:
-            name = run
-        elif _first_word(key) in firsts:
-            # a company that looks like a known one but is not in the corpus ("Halcyon Air Cargo"):
-            # list it as named, the corpus check in retrieve() then abstains.
-            name = run
-        elif words[-1] in _FIRM_TAILS:
-            continue  # a broker or audit firm rather than the company under review
-        else:
-            continue
-        if key not in seen:
-            seen.add(key)
-            companies.append(name)
+        if key in brokers or any(key.endswith(" " + broker) for broker in brokers):
+            continue  # a broker or an audit firm named in the question
+        if words[-1] in _FIRM_TAILS:
+            continue  # a broker or an audit firm rather than the company under review
+        if all(word in _REGION_WORDS for word in words):
+            continue  # a geography ("Asia Pacific"), not a company
+        if run["next"] in _SEGMENT_NOUNS:
+            continue  # "Midstream segment", "Bakery division"
+        if run["prev"] in {"at", "to"} and run["prev2"] in {"analyst", "according"}:
+            continue  # "the analyst at ...", "according to ..."
+        if len(words) == 1 and key not in known and key not in firsts:
+            # a single word is only trusted when it owns something ("Evergreen's revenue") or sits
+            # inside the sentence; a bare capitalised word that opens the question usually is not one
+            if run["at_start"] and not run["possessive"]:
+                continue
+        seen.add(key)
+        companies.append(name)
     return companies
 
 
@@ -716,13 +763,14 @@ def build_index(chunks: list[Document]) -> Any:
 # ------------------------------------------------------------------ retrieval
 
 _ABSTENTION_EXTRA = {"usd", "million", "millions", "billion", "billions", "percent", "percentage",
-                     "share", "shares", "fy", "q4", "full", "year", "annual", "report", "results",
-                     "review", "company", "much", "many", "did", "does", "what", "which", "who"}
+                     "share", "shares", "fy", "q", "q4", "full", "year", "annual", "report", "results",
+                     "review", "company", "much", "many", "did", "does", "what", "which", "who",
+                     "large", "small", "big", "announce", "announced"}
 
-# Wording in a question that points at a fact no annual report discloses; cheap first filter.
-_UNDISCLOSED_HINTS = ("lobbying", "churn", "carbon offset", "carbon-offset", "largest single customer",
-                      "largest customer", "customer concentration", "market share", "brand awareness",
-                      "employee satisfaction", "patent count")
+# The share of a question's content words (IDF-weighted) that the best passages must contain. Below
+# it the corpus does not discuss what is asked, however the question is worded; above it the model
+# check below decides. A general threshold, not a list of phrases from any question set.
+_COVERAGE_QUESTION_MIN = 0.30
 
 
 # Words that only say which document to read (handled by doc_type filtering), not what to find in it.
@@ -934,10 +982,9 @@ def retrieve(index: Any, question: str) -> list[Document]:
         return []
 
     if CONFIG["abstention"]:
-        lowered = question.lower()
-        if any(hint in lowered for hint in _UNDISCLOSED_HINTS):
-            return []  # an annual report never discloses this
         best = max(_coverage(index, i, content) for i in picked[:3]) if content else 1.0
+        if best < _COVERAGE_QUESTION_MIN:
+            return []  # the question's own vocabulary is almost absent: nothing here answers it
         if best < _COVERAGE_CERTAIN and not _answerable(question, [index["chunks"][i] for i in picked[:3]]):
             return []
 

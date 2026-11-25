@@ -1,4 +1,4 @@
-# FTEC5660 Homework 4 — solution
+# FTEC5660 Homework 4
 
 Retrieval for a RAG assistant over company reports: HTML parsing, chunking with metadata, query
 parsing, lexical retrieval with a hard cap of five chunks, and abstention.
@@ -13,12 +13,14 @@ configuration with every switch off (B0).
 
 Task 6 (reflection) is in [Reflection.pdf](Reflection.pdf).
 
+## Homework 4 solution
+
 **Public test set (60 questions, 40 documents): 75.0 / 75** on the automated tasks; the run takes
-about 18 s, of which 13 s is retrieval (19 answerability calls) and the rest the generator.
+about 21 s, of which 15 s is retrieval (20 answerability calls) and the rest the generator.
 
----
+### 1. Pipeline
 
-## 1. Pipeline
+Figure 1: retrieval pipeline. Every stage is one switch in `hw4.CONFIG`, named in square brackets.
 
 ```
 corpus/doc_038.html
@@ -30,14 +32,16 @@ corpus/doc_038.html
         │
         ├── narrative blocks ──▶ grouped up to 1,200 chars, split on paragraph/word boundaries
         │
-        └── each <table> ──▶ table_to_text(): caption line, then one line per table row,
+        └── each <table> ──▶ table_to_text()  [table_to_text]
+                             caption line, then one line per table row,
                              "Revenue | 2025: 2,710.4 | 2024: 2,629.1"
                              (colspan/rowspan expanded, section rows kept as titles)
         │
         ▼
- chunk_document: one chunk per table, one chunk per narrative block, each ≤ 1,500 chars,
- with metadata source / company / fiscal_year / doc_type, and a header line
+ chunk_document  [structured_chunking]: one chunk per table, one chunk per narrative block,
+ each ≤ 1,500 chars, with metadata source / company / fiscal_year / doc_type, and a header line
  "Northgate Robotics | FY2025 | annual report | 6. Financial statements — Consolidated balance sheet"
+  [context_header]
         │
         ▼
  build_index: BM25Okapi (k1=1.5, b=0.75) over the chunk text plus a per-company/per-year directory,
@@ -48,18 +52,19 @@ corpus/doc_038.html
         │
         ▼
  retrieve
-   1. hard abstention: a company that is not in the corpus, or a year the company's documents of
-      that type do not state → []
-   2. candidate pool: metadata filter on (company, doc_type); the company's other document types
-      are a fallback when the pool is tiny
-   3. score = BM25 + year bonus + 6·(IDF-weighted share of question terms present)
+   1. hard abstention  [abstention]: a company that is not in the corpus, or a year the company's
+      documents of that type do not state → []
+   2. candidate pool  [metadata_filter]: metadata filter on (company, doc_type); the company's other
+      document types are a fallback when the pool is tiny
+   3. score  [hybrid_scoring] = BM25  [better_tokenizer] + year bonus
+                    + 6·(IDF-weighted share of question terms present)
                     + 1.5·(question terms that land on a table row)
-   4. comparison: one ranking per company, so each company keeps a chunk
-   5. dedupe on (company, table caption/section); keep the top 3 (2 per company for a comparison),
-      at most 4
-   6. soft abstention: a phrasing that reports never disclose (lobbying, churn, …) → []; otherwise,
-      unless the lexical coverage is clearly high, one deepseek-v4-flash YES/NO call asking whether
-      the passages state the fact
+   4. comparison  [per_company_retrieval]: one ranking per company, so each company keeps a chunk
+   5. dedupe on (company, table caption/section)  [compact_context]; keep the top 3
+      (2 per company for a comparison), at most 4
+   6. soft abstention  [abstention]: a question whose content words cover less than 30% of the best
+      passages → []; otherwise, unless the lexical coverage is clearly high, one deepseek-v4-flash
+      YES/NO call asking whether the passages state the fact
         │
         ▼
  generate (fixed, temperature 0) → one number, one name, or NOT FOUND
@@ -81,9 +86,7 @@ of question terms the chunk contains and a bonus for terms that appear on a tabl
 figure above is the one to read together with the table below: every step after B0 is one of the
 rows.
 
----
-
-## 2. Ablation study
+### 2. Ablation study
 
 Every row turns on exactly one switch in `hw4.CONFIG` relative to the row above it, starting from a
 configuration in which every switch is off. `ablation.py` runs the real `chunk_document` /
@@ -95,87 +98,94 @@ generator.
 
 | # | Configuration | Change vs. previous row | Recall@5 | Kept | Rejected | Acc | chunks |
 |---|---|---|---|---|---|---|---|
-| B0 | naive RAG | `get_text()` (a table becomes a stream of cells), `RecursiveCharacterTextSplitter(1000, 150)`, `rank_bm25` top-5 over the whole corpus, no query parsing, never `[]` | 28.3% | 100% | 0% | 43.3% | 5.00 |
-| V1 | `table_to_text` | each table becomes one line per row with its label and column headers; still flat-split | 23.9% | 100% | 0% | 41.7% | 5.00 |
-| V2 | structured chunking | one chunk per table (split on row boundaries), narrative grouped by section instead of by character count | 21.7% | 100% | 0% | 38.3% | 5.00 |
-| V3 | metadata filtering | `parse_query()`; the BM25 pool becomes the question's company and document type | 69.6% | 100% | 0% | 76.7% | 5.00 |
-| V4 | hybrid scoring | BM25 + a year bonus + the IDF-weighted share of question terms present + a table-row bonus | 100.0% | 100% | 0% | 98.3% | 5.00 |
-| V5 | context header | every chunk starts with company \ | FY \ | doc type \ | caption \ | section | 97.8% | 100% | 0% | 93.3% | 5.00 |
-| V6 | better tokenizer | stop words, possessives, numbers without commas, plural folding, synonyms | 97.8% | 100% | 0% | 95.0% | 5.00 |
-| V7 | per-company retrieval | a comparison runs one ranking per company | 100.0% | 100% | 0% | 96.7% | 4.80 |
-| V8 | abstention | `[]` for an unknown company, an unstated year, an undisclosed-fact phrase, or a failed model YES/NO check | 100.0% | 100% | 100% | 98.3% | 3.63 |
-| V9 | compact context | dedupe by table/section, 3 chunks (2 per company for a comparison), drop the tail below 35% of the best score | 100.0% | 100% | 100% | 100.0% | 2.47 |
+| B0 | naive RAG | `get_text()` (a table becomes a stream of cells), `RecursiveCharacterTextSplitter(1000, 150)`, `rank_bm25` top-5 over the whole corpus, no query parsing, never `[]` | 28.3% | 100.0% | 0.0% | 43.3% | 5.00 |
+| V1 | `table_to_text` | each table becomes one line per row with its label and column headers; still flat-split | 23.9% | 100.0% | 0.0% | 41.7% | 5.00 |
+| V2 | structured chunking | one chunk per table (split on row boundaries), narrative grouped by section instead of by character count | 21.7% | 100.0% | 0.0% | 38.3% | 5.00 |
+| V3 | metadata filtering | `parse_query()`; the BM25 pool becomes the question's company and document type | 69.6% | 100.0% | 0.0% | 76.7% | 5.00 |
+| V4 | hybrid scoring | BM25 + a year bonus + the IDF-weighted share of question terms present + a table-row bonus | 100.0% | 100.0% | 0.0% | 98.3% | 5.00 |
+| V5 | context header | every chunk starts with company \| FY \| doc type \| caption \| section | 97.8% | 100.0% | 0.0% | 93.3% | 5.00 |
+| V6 | better tokenizer | stop words, possessives, numbers without commas, plural folding, synonyms | 97.8% | 100.0% | 0.0% | 93.3% | 5.00 |
+| V7 | per-company retrieval | a comparison runs one ranking per company | 100.0% | 100.0% | 0.0% | 96.7% | 4.80 |
+| V8 | abstention | `[]` for an unknown company, an unstated year, a question whose content words cover less than 30% of the best passages, or a failed model YES/NO check | 100.0% | 100.0% | 100.0% | 100.0% | 3.63 |
+| V9 | compact context | dedupe by table/section, 3 chunks (2 per company for a comparison), drop the tail below 35% of the best score | 100.0% | 100.0% | 100.0% | 100.0% | 2.47 |
 
-Points by task for the final row: 2.2 = 10.0, 2.3 = 15.0, 3 = 10.0, 4 = 20.0 — 75.0 / 75 together
-with Tasks 1.1 and 1.2, which these switches do not affect (`hw4.py` reports 8.00 and 7.00).
+Points by task for the final row: 1.1 = 8.0, 1.2 = 7.0, 2.1 = 5.0, 2.2 = 10.0, 2.3 = 15.0,
+3 = 10.0, 4 = 20.0 — 75.0 / 75.
 
-### What each change did
+#### What each change did
 
 - **V1, structured tables (−4.4 recall points, −1.6 accuracy points at this row).** On its own, under
   plain BM25 over the whole corpus, writing each table as "row label | column: value" lines does not
   help: 35 misses against B0's 33. The row text is longer (343 → 402 chunks), and each row now
   repeats column headers such as "2025" and "2024" that every report shares, which probably adds
-  noise rather than signal for BM25 (I did not isolate this further). The value of the change appears later: once the right table is retrieved (V3–V4), the
-  generator needs the row label and the year next to each number to pick the right figure, which a
-  stream of bare cells does not give it. It is also what Task 1.1 grades.
+  noise rather than signal for BM25. Two comparisons stop being retrieved (q013, q052); q053 starts
+  being retrieved, so the dip is a reshuffle, not a uniform loss. The value of the change appears
+  later: once the right table is retrieved (V3–V4), the generator needs the row label and the year
+  next to each number to pick the right figure, which a stream of bare cells does not give it. It is
+  also what Task 1.1 grades.
 - **V2, structured chunking (−2.2 recall points, −3.4 accuracy points here).** One chunk per table
   and section-grouped narrative instead of 1,000-character windows grows the corpus from 402 to 865
-  chunks, so a fixed top-5 over the whole corpus covers a smaller share of it, and recall dips again.
-  Like V1, it is a prerequisite rather than a gain on its own: metadata filtering (V3), the per-table
-  header (V5) and dedupe by table (V9) all work on whole tables and sections.
-- **V3, metadata filtering (+47.9 recall points, the largest single step).** This is what makes the
-  task tractable. Without it a query for "revenue FY2025" pulls chunks from every company and from
-  both annual reports of the right one, and the five returned chunks are usually five look-alikes.
-  Filtering the pool on the parsed company and document type takes it from 865 chunks to roughly
-  70 annual-report chunks, or under 10 research-report or earnings-call chunks, and the answerable
-  misses drop from 36 to 14 — all of them table questions (11) and comparisons (3).
+  chunks, so a fixed top-5 over the whole corpus covers a smaller share of it, and misses rise to
+  36. Like V1, it is a prerequisite rather than a gain on its own: metadata filtering (V3), the
+  per-table header (V5) and dedupe by table (V9) all work on whole tables and sections.
+- **V3, metadata filtering (+47.9 recall points, +38.4 accuracy points, the largest single step).**
+  This is what makes the task tractable. Without it a query for "revenue FY2025" pulls chunks from
+  every company and from both annual reports of the right one, and the five returned chunks are
+  usually five look-alikes. Filtering the pool on the parsed company and document type takes it from
+  865 chunks to roughly 70 annual-report chunks, or under 10 research-report or earnings-call chunks,
+  and the misses drop from 36 to 14 — all of them table questions (11) and comparisons (3).
 - **V4, hybrid scoring (+30.4 recall points; all 14 misses recovered).** Plain BM25 over a filtered
   pool still ranks a cover page or a narrative section above a balance sheet, because those repeat
-  the company name while the line item ("inventories") appears once, in the statements. The
-  coverage term (the IDF-weighted share of the question's terms that the chunk actually contains)
-  plus the table-row bonus move the right table to the top; the year bonus selects the column the
-  question asks about. With both the pool and the scoring right, recall reaches 100% here.
+  the company name while the line item ("inventories") appears once, in the statements. The coverage
+  term (the IDF-weighted share of the question's terms that the chunk actually contains) plus the
+  table-row bonus move the right table to the top; the year bonus selects the column the question
+  asks about. With both the pool and the scoring right, recall reaches 100% here; one answer is still
+  wrong (q050, EMEA revenue: 158.1 instead of 493.5, a neighbouring regional figure in the same
+  table).
 - **V5, context header (−2.2 recall points, −5.0 accuracy points).** Repeating "company \| FY2025 \|
   annual report \| Consolidated balance sheet" on every chunk adds the section vocabulary a question
   uses, but it also repeats the company name and fiscal year on *every* chunk of a report, which
-  makes chunks of the same report look more alike than before. Two questions regressed: a fact
-  question ("In which city is Halcyon Freight headquartered?", q027) is no longer retrieved, because
-  its answer sits in a short narrative paragraph that now competes with header-carrying chunks of the
-  same report; and an unanswerable question ("Orchid Bay Resorts' operating income", q044 —
-  abstention is still off at this row) gets passages whose headers look close enough to the question
-  that the generator answers with a number instead of NOT_FOUND. I kept the header anyway: it is what
-  tells the generator which company and year a passage belongs to, which the final accuracy depends
-  on, and V7/V9 recover the crowding. But the row is reported as measured — on the public set the
-  header is not free.
-- **V6, better tokenizer (recall unchanged, +1.7 accuracy points).** Stop words, possessive stripping
-  (`Brightwater Energy's` → `brightwater energy`), numbers without commas and plural folding swap one
-  hit for another: q027 (headquarters city, lost at V5) is recovered through the synonym
-  `headquartered` → `headquarters`, and q013 (a comparison) becomes a miss, so recall stays at 45/46.
-  Accuracy rises because one more table question (q024) is also answered correctly, and because the
-  synonym map (`guide` → `outlook`, `headcount` → `employees`) is what the coverage term and the
-  abstention threshold rely on. Without it a question phrased with a word the report never uses scores
-  zero coverage and is wrongly rejected.
-- **V7, per-company retrieval (recall 97.8% → 100%; comparisons to 100%).** A comparison needs two
-  facts in two documents; one ranking over a mixed pool returns five chunks of whichever company
-  scores higher. Ranking each company separately and taking its top chunk(s) guarantees both are
-  represented. It also brings the mean context from 5.00 to 4.80 chunks.
-- **V8, abstention (rejected 0% → 100%, Task 3 from 0.0 to 10.0 points).** Two hard rules cover 10 of
-  the 14 unanswerable questions with no effect on the answerable ones: a company that is not in the
-  corpus, and a year that the company's documents of that type do not state. The other four are
-  undisclosed facts (lobbying expenses, churn, carbon offset purchases, revenue from the largest
-  customer). A phrase list catches those phrasings before any model call; a YES/NO check on the top
-  three chunks is the fallback for an undisclosed fact phrased in words the list does not know, and it
-  runs about 19 times per run. The phrase list is the weakest part of this design: it is written
-  against the phrasings of the public questions, so a private question about a different undisclosed
-  figure falls through to the model check, which is the weaker of the two.
-- **V9, compact context (recall unchanged, +1.7 accuracy points, 4.80 → 2.47 chunks).** Dedupe (one
-  chunk per table/section), a cap of three chunks, and dropping the tail below 35% of the best score
-  roughly halve the context. Recall is unchanged because the right chunk was already near the top;
-  what changes is that the generator sees fewer look-alike passages, and on the public set that is
-  enough to turn the one remaining wrong answer into a correct one. A one-question gain is within
-  noise, so the stronger argument for this row is the shorter, cheaper context at no recall cost.
+  makes chunks of the same report look more alike than before; the corpus grows 865 → 886 chunks.
+  Three tests regress: a fact question ("In which city is Halcyon Freight headquartered?", q027) is
+  no longer retrieved, because its answer sits in a short narrative paragraph that now competes with
+  header-carrying chunks of the same report; and two unanswerable questions (q001, "Northgate Robotic
+  Systems"; q044, "Orchid Bay Resorts") get passages whose headers look close enough to the question
+  that the generator answers with a number instead of NOT_FOUND (abstention is still off at this
+  row). I kept the header anyway: it is what tells the generator which company and year a passage
+  belongs to, which the final accuracy depends on, and V7/V9 recover the crowding. But the row is
+  reported as measured — on the public set the header is not free.
+- **V6, better tokenizer (recall and accuracy unchanged at this row).** Stop words, possessive
+  stripping (`Brightwater Energy's` → `brightwater energy`), numbers without commas and plural
+  folding swap one hit for another: q027 (headquarters city, lost at V5) is recovered through the
+  synonym `headquartered` → `headquarters`, and q013 (a comparison) becomes a miss, so recall stays
+  at 45/46 and the accuracy is the same with a different wrong answer. The synonyms
+  (`guide` → `outlook`, `headcount` → `employees`) still matter downstream: the coverage term and the
+  abstention threshold rely on them, and without them a question phrased with a word the report never
+  uses scores zero coverage and is wrongly rejected.
+- **V7, per-company retrieval (recall 97.8% → 100%; comparisons to 100%; +3.4 accuracy points).**
+  A comparison needs two facts in two documents; one ranking over a mixed pool returns five chunks of
+  whichever company scores higher. Ranking each company separately and taking its top chunk(s)
+  guarantees both are represented: q013 is back, and the narrower context also makes q001 return
+  NOT_FOUND and q050 return 493.5. It brings the mean context from 5.00 to 4.80 chunks.
+- **V8, abstention (rejected 0% → 100%, Task 3 from 0.0 to 10.0 points; +3.3 accuracy points).**
+  All 14 unanswerable questions now return `[]`, including q044, the last wrong answer. Ten are
+  covered by two hard rules with no effect on the answerable ones: a company that is not in the
+  corpus (5), and a year that the company's documents of that type do not state (5); this works for
+  any name, not just for names that resemble a corpus company, because `parse_query` lists every
+  company a question names. The other four are undisclosed facts (lobbying expenses, churn, carbon
+  offset purchases, revenue from the largest customer). They are caught by a wording-independent
+  rule: if the IDF-weighted share of the question's content words found in the best three passages is
+  below 30%, the corpus does not discuss what is asked, and `retrieve` returns `[]` before any model
+  call. Above that threshold and below the "certain" level, a YES/NO check on the top three chunks is
+  the fallback, and it runs about 20 times per run. There is no phrase list of question wording
+  anywhere in the pipeline: the threshold is a property of the corpus, not of the public questions,
+  so a private question about a different undisclosed figure is treated the same way.
+- **V9, compact context (recall and accuracy unchanged, 3.63 → 2.47 chunks).** Dedupe (one chunk per
+  table/section), a cap of three chunks, and dropping the tail below 35% of the best score roughly
+  halve the context. Accuracy is already 100% at V8, so this row buys nothing on the public set
+  beyond a shorter, cheaper context at no recall cost.
 
-### Error analysis
+#### Error analysis
 
 What the remaining misses are, row by row, and why the ladder has two small dips:
 
@@ -196,12 +206,14 @@ What the remaining misses are, row by row, and why the ladder has two small dips
    above: the cover page outranks the statements (11 table questions) and a comparison still gets five
    chunks of one company (3). This row shows that metadata alone is not enough — it narrows the pool
    but does not rank inside it.
-4. **What the last rows fix and what they cost.** V5's header costs one narrative hit (q027) and one
-   unanswerable question (q044); V6 recovers q027 but loses q013; V7 recovers q013 and makes every
-   comparison a hit; V9 fixes the last wrong answer by shrinking the context. The V5 regression is the
-   instructive case: adding metadata to the chunk text also adds it to *every* chunk of a report, so
-   the company name and year stop distinguishing one chunk of that report from another and the section
-   title has to carry the ranking.
+4. **What the last rows fix and what they cost.** V5's header costs one narrative hit (q027) and lets
+   two unanswerable questions be answered (q001, q044); V6 recovers q027 but loses the comparison
+   q013; V7 recovers q013 and, with a narrower per-company context, also fixes q001 and q050; V8
+   turns q044 — the last wrong answer — into `[]`. From V8 the accuracy is 100%, and V9 changes no
+   answer, only the context size (3.63 → 2.47 chunks). The V5 regression is the instructive case:
+   adding metadata to the chunk text also adds it to *every* chunk of a report, so the company name
+   and year stop distinguishing one chunk of that report from another and the section title has to
+   carry the ranking.
 
 Development bugs found while building this, kept because the same mistakes are easy to repeat:
 
@@ -216,3 +228,8 @@ Development bugs found while building this, kept because the same mistakes are e
   appear nowhere in the corpus, so the coverage of an otherwise perfect chunk fell to 8% and the
   answerability check rejected it. Stripping the possessive before tokenising took the score from 66
   to 72.
+- **The month list was built from a string, not from its words.** `{m.lower() for m in ("January …
+  December")}` iterates characters, so no month was ever in `_NAME_STOP`. The old parser hid this by
+  dropping every unrecognised name run; once `parse_query` started keeping unknown companies, "31
+  December" came back as a company. Splitting the string fixed it (`\.split()`), and Task 2.2 stayed
+  at 100%.

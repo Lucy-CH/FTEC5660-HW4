@@ -103,14 +103,17 @@ generator.
 | V2 | structured chunking | one chunk per table (split on row boundaries), narrative grouped by section instead of by character count | 21.7% | 100.0% | 0.0% | 38.3% | 5.00 |
 | V3 | metadata filtering | `parse_query()`; the BM25 pool becomes the question's company and document type | 69.6% | 100.0% | 0.0% | 76.7% | 5.00 |
 | V4 | hybrid scoring | BM25 + a year bonus + the IDF-weighted share of question terms present + a table-row bonus | 100.0% | 100.0% | 0.0% | 98.3% | 5.00 |
-| V5 | context header | every chunk starts with company \| FY \| doc type \| caption \| section | 97.8% | 100.0% | 0.0% | 93.3% | 5.00 |
+| V5 | context header | every chunk starts with company \| FY \| doc type \| caption \| section | 97.8% | 100.0% | 0.0% | 95.0% | 5.00 |
 | V6 | better tokenizer | stop words, possessives, numbers without commas, plural folding, synonyms | 97.8% | 100.0% | 0.0% | 93.3% | 5.00 |
-| V7 | per-company retrieval | a comparison runs one ranking per company | 100.0% | 100.0% | 0.0% | 96.7% | 4.80 |
+| V7 | per-company retrieval | a comparison runs one ranking per company | 100.0% | 100.0% | 0.0% | 98.3% | 4.80 |
 | V8 | abstention | `[]` for an unknown company, an unstated year, a question whose content words cover less than 30% of the best passages, or a failed model YES/NO check | 100.0% | 100.0% | 100.0% | 100.0% | 3.63 |
 | V9 | compact context | dedupe by table/section, 3 chunks (2 per company for a comparison), drop the tail below 35% of the best score | 100.0% | 100.0% | 100.0% | 100.0% | 2.47 |
 
 Points by task for the final row: 1.1 = 8.0, 1.2 = 7.0, 2.1 = 5.0, 2.2 = 10.0, 2.3 = 15.0,
-3 = 10.0, 4 = 20.0 — 75.0 / 75.
+3 = 10.0, 4 = 20.0 — 75.0 / 75. The numbers above are from one run of `ablation.py`, written to
+`ablation_results.csv`; the recall, kept and rejected columns were identical on a rerun, while the
+accuracy column passes through the fixed generator, which is not fully deterministic even at
+temperature 0, so a rerun can move an accuracy cell by one question.
 
 #### What each change did
 
@@ -142,33 +145,32 @@ Points by task for the final row: 1.1 = 8.0, 1.2 = 7.0, 2.1 = 5.0, 2.2 = 10.0, 2
   asks about. With both the pool and the scoring right, recall reaches 100% here; one answer is still
   wrong (q050, EMEA revenue: 158.1 instead of 493.5, a neighbouring regional figure in the same
   table).
-- **V5, context header (−2.2 recall points, −5.0 accuracy points).** Repeating "company \| FY2025 \|
+- **V5, context header (−2.2 recall points, −3.3 accuracy points).** Repeating "company \| FY2025 \|
   annual report \| Consolidated balance sheet" on every chunk adds the section vocabulary a question
   uses, but it also repeats the company name and fiscal year on *every* chunk of a report, which
   makes chunks of the same report look more alike than before; the corpus grows 865 → 886 chunks.
-  Three tests regress: a fact question ("In which city is Halcyon Freight headquartered?", q027) is
-  no longer retrieved, because its answer sits in a short narrative paragraph that now competes with
-  header-carrying chunks of the same report; and two unanswerable questions (q001, "Northgate Robotic
-  Systems"; q044, "Orchid Bay Resorts") get passages whose headers look close enough to the question
-  that the generator answers with a number instead of NOT_FOUND (abstention is still off at this
-  row). I kept the header anyway: it is what tells the generator which company and year a passage
+  Two more answers go wrong at this row: a fact question ("In which city is Halcyon Freight
+  headquartered?", q027) is no longer retrieved, because its answer sits in a short narrative
+  paragraph that now competes with header-carrying chunks of the same report; and an unanswerable
+  question gets a passage whose header looks close enough to the question that the generator answers
+  with a number instead of NOT_FOUND (abstention is still off at this row). I kept the header anyway: it is what tells the generator which company and year a passage
   belongs to, which the final accuracy depends on, and V7/V9 recover the crowding. But the row is
   reported as measured — on the public set the header is not free.
-- **V6, better tokenizer (recall and accuracy unchanged at this row).** Stop words, possessive
+- **V6, better tokenizer (recall unchanged, one answer lower at this row).** Stop words, possessive
   stripping (`Brightwater Energy's` → `brightwater energy`), numbers without commas and plural
   folding swap one hit for another: q027 (headquarters city, lost at V5) is recovered through the
   synonym `headquartered` → `headquarters`, and q013 (a comparison) becomes a miss, so recall stays
-  at 45/46 and the accuracy is the same with a different wrong answer. The synonyms
+  at 45/46; one additional answer is wrong at this row. The synonyms
   (`guide` → `outlook`, `headcount` → `employees`) still matter downstream: the coverage term and the
   abstention threshold rely on them, and without them a question phrased with a word the report never
   uses scores zero coverage and is wrongly rejected.
-- **V7, per-company retrieval (recall 97.8% → 100%; comparisons to 100%; +3.4 accuracy points).**
+- **V7, per-company retrieval (recall 97.8% → 100%; comparisons to 100%; +5.0 accuracy points).**
   A comparison needs two facts in two documents; one ranking over a mixed pool returns five chunks of
   whichever company scores higher. Ranking each company separately and taking its top chunk(s)
-  guarantees both are represented: q013 is back, and the narrower context also makes q001 return
-  NOT_FOUND and q050 return 493.5. It brings the mean context from 5.00 to 4.80 chunks.
-- **V8, abstention (rejected 0% → 100%, Task 3 from 0.0 to 10.0 points; +3.3 accuracy points).**
-  All 14 unanswerable questions now return `[]`, including q044, the last wrong answer. Ten are
+  guarantees both are represented: q013 is back and only one answer is still wrong at this row. It
+  brings the mean context from 5.00 to 4.80 chunks.
+- **V8, abstention (rejected 0% → 100%, Task 3 from 0.0 to 10.0 points; +1.7 accuracy points).**
+  All 14 unanswerable questions now return `[]`, q044 among them. Ten are
   covered by two hard rules with no effect on the answerable ones: a company that is not in the
   corpus (5), and a year that the company's documents of that type do not state (5); this works for
   any name, not just for names that resemble a corpus company, because `parse_query` lists every
@@ -207,10 +209,10 @@ What the remaining misses are, row by row, and why the ladder has two small dips
    chunks of one company (3). This row shows that metadata alone is not enough — it narrows the pool
    but does not rank inside it.
 4. **What the last rows fix and what they cost.** V5's header costs one narrative hit (q027) and lets
-   two unanswerable questions be answered (q001, q044); V6 recovers q027 but loses the comparison
-   q013; V7 recovers q013 and, with a narrower per-company context, also fixes q001 and q050; V8
-   turns q044 — the last wrong answer — into `[]`. From V8 the accuracy is 100%, and V9 changes no
-   answer, only the context size (3.63 → 2.47 chunks). The V5 regression is the instructive case:
+   unanswerable questions be answered while abstention is off; V6 recovers q027 but loses the
+   comparison q013; V7 recovers q013 and leaves one wrong answer; V8 turns the remaining unanswerable
+   answers into `[]`. From V8 the accuracy is 100%, and V9 changes no answer, only the context size
+   (3.63 → 2.47 chunks). The V5 regression is the instructive case:
    adding metadata to the chunk text also adds it to *every* chunk of a report, so the company name
    and year stop distinguishing one chunk of that report from another and the section title has to
    carry the ranking.
